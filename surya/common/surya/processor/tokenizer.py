@@ -82,6 +82,39 @@ class GreedyMathUTF16Tokenizer(S3DownloaderMixin, PreTrainedTokenizer):
             node.id = tid
         return root
 
+    def _build_escape_patterns(self, math_token_to_rawid):
+        """Build pattern list from vocab commands that start with control characters.
+
+        Scans the math vocab for LaTeX commands that could be corrupted by JSON
+        escape sequence interpretation (e.g., \\begin becomes <backspace>egin).
+        """
+        control_chars = {
+            '\x08': 'b',  # backspace
+            '\t': 't',    # tab
+            '\n': 'n',    # newline
+            '\r': 'r',    # carriage return
+            '\f': 'f',    # form feed
+            '\x07': 'a',  # bell
+            '\x0b': 'v',  # vertical tab
+        }
+
+        patterns = {char: [] for char in control_chars}
+
+        for token in math_token_to_rawid.keys():
+            if token.startswith('\\') and len(token) > 1:
+                letter = token[1:2]  # First char after backslash
+                for ctrl_char, ctrl_letter in control_chars.items():
+                    if letter == ctrl_letter:
+                        # This token could be corrupted: \token -> <ctrl>oken
+                        suffix = token[2:]  # Everything after \X
+                        patterns[ctrl_char].append((suffix, token))
+
+        # Sort by length (longest first) to avoid partial matches
+        for char in patterns:
+            patterns[char].sort(key=lambda x: len(x[0]), reverse=True)
+
+        return patterns
+
     @classmethod
     def _encode_math_greedy(
         cls,
@@ -248,6 +281,9 @@ class GreedyMathUTF16Tokenizer(S3DownloaderMixin, PreTrainedTokenizer):
         # Trie for math greedy match
         self.trie = self._build_trie(self.math_token_to_rawid)
 
+        # Build escape fix patterns from vocab
+        self.latex_escape_patterns = self._build_escape_patterns(self.math_token_to_rawid)
+
         # Tell HF about special tokens (metadata)
         kwargs.setdefault("bos_token", bos_token)
         kwargs.setdefault("eos_token", eos_token or "</S>")
@@ -308,25 +344,33 @@ class GreedyMathUTF16Tokenizer(S3DownloaderMixin, PreTrainedTokenizer):
         return ids
 
     def _fix_latex_escapes(self, text: str) -> str:
-        """Fix improperly escaped LaTeX commands in math vocab.
+        """Fix improperly escaped LaTeX commands in decoded text.
 
-        The vocab JSON has escape sequences like \b and \t that get interpreted
-        as backspace and tab characters instead of literal backslash+letter.
-        This method restores them to their intended LaTeX form.
+        Operates on the complete decoded string, replacing control character
+        sequences with their intended LaTeX commands based on vocab patterns.
         """
-        # Map control characters back to their intended LaTeX sequences
-        replacements = {
-            '\x08': '\\b',  # backspace → \b (for \begin, \bar, etc.)
-            '\t': '\\t',    # tab → \t (for \tau, \times, \text, etc.)
-            '\n': '\\n',    # newline → \n (if any)
-            '\r': '\\r',    # carriage return → \r (if any)
-            '\f': '\\f',    # form feed → \f (if any)
-            '\x07': '\\a',  # bell → \a (if any)
-            '\x0b': '\\v',  # vertical tab → \v (if any)
-        }
-        for bad_char, good_seq in replacements.items():
-            text = text.replace(bad_char, good_seq)
-        return text
+        result = []
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if char in self.latex_escape_patterns:
+                # Check if any pattern matches
+                matched = False
+                for pattern, replacement in self.latex_escape_patterns[char]:
+                    if text[i+1:].startswith(pattern):
+                        result.append(replacement)
+                        i += 1 + len(pattern)
+                        matched = True
+                        break
+                if not matched:
+                    # Not a LaTeX command, keep the control char as-is
+                    result.append(char)
+                    i += 1
+            else:
+                result.append(char)
+                i += 1
+
+        return ''.join(result)
 
     def _decode_core(self, ids: Iterable[int]) -> str:
         out: List[str] = []
@@ -334,20 +378,21 @@ class GreedyMathUTF16Tokenizer(S3DownloaderMixin, PreTrainedTokenizer):
 
         def flush():
             if buf:
-                out.append(self._fix_latex_escapes(self._from_utf16_units(buf)))
+                out.append(self._from_utf16_units(buf))
                 buf.clear()
 
         for tid in ids:
             if tid >= self.MATH_BASE and tid < self.SPECIAL_BASE:
                 flush()
-                out.append(self._fix_latex_escapes(self.math_absid_to_token.get(tid, "")))
+                out.append(self.math_absid_to_token.get(tid, ""))
             elif tid >= self.SPECIAL_BASE:
                 flush()
-                out.append(self._fix_latex_escapes(self.absid_to_special.get(tid, "")))
+                out.append(self.absid_to_special.get(tid, ""))
             else:
                 buf.append(int(tid))
         flush()
-        return "".join(out)
+        decoded = "".join(out)
+        return self._fix_latex_escapes(decoded)
 
     # ---- Tokenizer interface ----
     def _tokenize(self, text: str, **kwargs) -> List[str]:
